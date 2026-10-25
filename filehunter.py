@@ -505,8 +505,12 @@ class App(tk.Tk):
                                            command=self._apply_view)
         self.only_dup_cb.pack(side="left", padx=(8, 0))
 
+        self.btn_faces = ttk.Button(tb, text="Sort by faces…", command=self._open_people)
+        Tooltip(self.btn_faces, "Finds the faces in your photos, groups them into people, and makes a "
+                                "folder for each person. Group photos go to the person you put first.")
         self.btn_more = ttk.Menubutton(tb, text="More")
         self.btn_more.pack(side="right")
+        self.btn_faces.pack(side="right", padx=(0, 18))
         self.more_menu = tk.Menu(self.btn_more, tearoff=False)
         self.btn_more["menu"] = self.more_menu
         self.more_menu.add_command(label="Find duplicate files", command=self._find_dups)
@@ -1600,7 +1604,7 @@ class App(tk.Tk):
         self._launch_transfer(sel, dest, mode)
 
     def _launch_transfer(self, sel, dest, mode, layout=None, conflict=None, skip_identical=None,
-                         verify=None):
+                         verify=None, subfolders=None):
         verb = "Move" if mode == "move" else "Copy"
         names = {}
         for k, d in self.drives.items():
@@ -1615,7 +1619,8 @@ class App(tk.Tk):
             sel, dest, mode=mode, layout=layout or self._layout_key(),
             conflict=conflict or self._conflict_key(),
             skip_identical=self.ident_var.get() if skip_identical is None else skip_identical,
-            verify=self.verify_var.get() if verify is None else verify, drive_names=names)
+            verify=self.verify_var.get() if verify is None else verify, drive_names=names,
+            subfolders=subfolders)
         self.transfer.start()
         self.xfer_row.grid()
         self.busy = True
@@ -1752,6 +1757,28 @@ class App(tk.Tk):
         self.xfer_lbl.configure(text=msg, style="Err.TLabel" if res["failed"] else "Ok.TLabel")
         self._update_buttons()
 
+    # =============================================================================== faces
+    def _open_people(self):
+        import filehunter_faces as faces_mod
+        import filehunter_people
+        exts = faces_mod.PHOTO_EXTS
+        ticked = [self.items[i] for i in sorted(self.checked)
+                  if self.items[i].ext in exts and not self.items[i].gone]
+        if ticked:
+            photos, note = ticked, "(the ticked photos)"
+        else:
+            photos = [it for it in self.items if it.ext in exts and not it.gone]
+            note = "(every photo in the results; tick some first to use only those)"
+        if not photos:
+            messagebox.showinfo(APP_NAME, "There are no photos in the results. Scan for Images "
+                                          "(JPG, PNG, WEBP, BMP, TIFF) first.", parent=self)
+            return
+        old = getattr(self, "_people_win", None)
+        if old is not None and old.winfo_exists():
+            old.lift()
+            return
+        self._people_win = filehunter_people.PeopleWindow(self, photos, note)
+
     # =============================================================================== report
     def _show_report(self):
         rep = getattr(self, "last_report", None)
@@ -1838,10 +1865,12 @@ class App(tk.Tk):
             return [shown[int(i)] for i in tv.selection()] or list(shown)
 
         def retry():
-            todo = [r for r in rows if r["status"] in ("failed", "notreached")]
-            items = [rep["items"][r["src"]] for r in todo if r["src"] in rep["items"]]
-            gone = [it for it in items if not os.path.exists(it.path)]
-            items = [it for it in items if os.path.exists(it.path)]
+            todo = [r for r in rows if r["status"] in ("failed", "notreached")
+                    and r["src"] in rep["items"]]
+            gone = [r for r in todo if not os.path.exists(r["src"])]
+            todo = [r for r in todo if os.path.exists(r["src"])]
+            items = [rep["items"][r["src"]] for r in todo]
+            subs = [r.get("sub", "") for r in todo] if any(r.get("sub") for r in todo) else None
             if gone:
                 info.configure(text=f"{len(gone):,} no longer exist and are left out.")
             if not items:
@@ -1858,7 +1887,7 @@ class App(tk.Tk):
             win.destroy()
             self._launch_transfer(items, rep["dest"], rep["mode"], layout=rep["layout"],
                                   conflict=rep["conflict"], skip_identical=rep["skip_identical"],
-                                  verify=rep["verify"])
+                                  verify=rep["verify"], subfolders=subs)
 
         def tick_in_results():
             want = {r["src"] for r in sel_rows()}
@@ -2097,6 +2126,7 @@ class App(tk.Tk):
         st(self.btn_x_stop, moving)
         self.btn_x_pause.configure(text="Resume" if moving and self.transfer.paused else "Pause")
         st(self.btn_more, idle and bool(self.items))
+        st(self.btn_faces, idle and bool(self.items))
         for w in (self.btn_all, self.btn_none, self.btn_invert):
             st(w, bool(self.visible) and not moving)
         st(self.btn_open, bool(self.tree.selection()))

@@ -1,3 +1,5 @@
 # Optional: photo previews for JPG, WEBP, BMP, TIFF and more.
 # FileHunter runs without it (PNG and GIF previews still work).
 Pillow>=10.0
+# Optional: "Sort by faces" needs OpenCV. FileHunter offers to install it the first time
+# you use that feature, or install it yourself with:  pip install opencv-python-headless numpy

@@ -1,5 +1,15 @@
 # Changelog
 
+## 1.3.0 — 2026-10-25
+
+- New **Sort by faces…**: finds the faces in your photos, groups them into people, and makes a folder
+  for each person. Name the people and put them in priority order: a group photo goes to the person
+  highest in the list (or, if you prefer, a copy goes to everyone in it). Photos with nobody from the
+  list can go to an "Others" folder.
+- See each person's faces and untick wrong ones, merge two groups that are the same person, or leave
+  someone out. Names and order are remembered for next time.
+- Runs entirely on your computer with OpenCV's free YuNet and SFace models (downloaded once, ~39 MB).
+
 ## 1.2.0 — 2026-10-25
 
 - New **Report** after every copy or move: lists each file that was not copied (failed, skipped,

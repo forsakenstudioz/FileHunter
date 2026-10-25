@@ -21,7 +21,7 @@ from datetime import datetime
 from pathlib import Path
 
 APP_NAME = "FileHunter"
-VERSION = "1.2.0"
+VERSION = "1.3.0"
 
 IS_WIN = os.name == "nt"
 IS_MAC = sys.platform == "darwin"
@@ -933,8 +933,10 @@ class Transfer:
 
     def __init__(self, items: list[FileItem], dest: str, mode: str = "copy", layout: str = "flat",
                  conflict: str = "rename", skip_identical: bool = True, verify: bool = False,
-                 drive_names: dict | None = None):
+                 drive_names: dict | None = None, subfolders: list[str] | None = None):
+        """subfolders: one folder name per item (e.g. per person); overrides the layout."""
         self.items = list(items)
+        self.subfolders = list(subfolders) if subfolders else None
         self.dest = os.path.abspath(dest)
         self.mode, self.layout, self.conflict = mode, layout, conflict
         self.skip_identical, self.verify = skip_identical, verify
@@ -977,10 +979,16 @@ class Transfer:
             self._hash_cache[key] = _hash_file(path, self.stop_ev, quick=quick)
         return self._hash_cache[key]
 
-    def _find_identical(self, src: str, size: int) -> str | None:
-        """Path of a file in the destination with exactly the same contents, if any."""
+    def _find_identical(self, src: str, size: int, within: str | None = None) -> str | None:
+        """Path of a file in the destination with exactly the same contents, if any.
+
+        within: only look in this folder (used when sorting into per-person folders, where the
+        same photo may rightly go into several folders)."""
         cands = [p for p in self._by_size.get(size, ())
                  if os.path.normcase(p) != os.path.normcase(_long(src))]
+        if within is not None:
+            w = os.path.normcase(_long(within))
+            cands = [p for p in cands if os.path.normcase(os.path.dirname(p)) == w]
         if not cands:
             return None
         q = self._hash(_long(src), True)
@@ -1026,13 +1034,14 @@ class Transfer:
             self.current = "Checking what is already in the destination…"
             self._index_destination()
         for idx, it in enumerate(self.items):
+            self._idx = idx
             self.index = idx
             if self.stop_ev.is_set():
                 break
             self.run_ev.wait()
             self.current, self.cur_done, self.cur_size = it.path, 0, it.size
             entry = {"op": self.mode, "src": it.path, "dst": "", "size": it.size, "status": "",
-                     "msg": ""}
+                     "msg": "", "sub": self.subfolders[idx] if self.subfolders else ""}
             try:
                 self._one(it, entry)
             except Exception as e:  # noqa: BLE001
@@ -1045,11 +1054,12 @@ class Transfer:
                 self._by_size.setdefault(it.size, []).append(_long(entry["dst"]))
             self.done_bytes = sum(i.size for i in self.items[: idx + 1])
         # files never reached (Stop pressed) belong in the report too
-        seen = {e["src"] for e in self.journal}
+        reached = len(self.journal)
         self.report = [dict(e) for e in self.journal] + [
             {"op": self.mode, "src": it.path, "dst": "", "size": it.size, "status": "notreached",
-             "msg": "not copied: stopped before this file was reached"}
-            for it in self.items if it.path not in seen]
+             "msg": "not copied: stopped before this file was reached",
+             "sub": self.subfolders[n] if self.subfolders else ""}
+            for n, it in enumerate(self.items) if n >= reached]
         self.finished = time.time()
         self.done = True
         save_history(self)
@@ -1059,12 +1069,16 @@ class Transfer:
         if not os.path.exists(_long(src)):
             entry["status"], entry["msg"] = "failed", "file no longer exists"
             return
-        dst = target_path(it, self.dest, self.layout, self.drive_names)
+        if self.subfolders:
+            dst = os.path.join(self.dest, _safe_part(self.subfolders[self._idx]), it.name)
+        else:
+            dst = target_path(it, self.dest, self.layout, self.drive_names)
         if os.path.normcase(os.path.abspath(dst)) == os.path.normcase(os.path.abspath(src)):
             entry["status"], entry["msg"], entry["dst"] = "skipped", "already in place", dst
             return
         if self.skip_identical and it.size > 0:
-            same = self._find_identical(src, it.size)
+            same = self._find_identical(src, it.size,
+                                        os.path.dirname(dst) if self.subfolders else None)
             if same:
                 entry["status"], entry["dst"] = "identical", same
                 entry["msg"] = f"same file already in the destination: {os.path.relpath(same, _long(self.dest))}"

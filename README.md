@@ -31,6 +31,20 @@ want, and copy or move it all into one place.
 - Skips Windows, Program Files, AppData, Recycle Bin and similar by default, so you get *your* files,
   not thousands of program and cache files. Untick it to search everything.
 
+**Sort photos by face**
+- Press **Sort by faces…** with photos in the results (or tick the ones you want). FileHunter finds the
+  faces, groups them into people and shows one face for each person.
+- Name each person and put them in **priority order**. A group photo goes into the folder of the person
+  highest in the list. Example: Ravi above Priya, so a photo of both goes to *Ravi*; swap them and it
+  goes to *Priya*. Or choose to put a copy into everyone's folder.
+- **See their faces…** shows every face found for a person; untick any that aren't them.
+  **Same person: merge** joins two groups of one person. Photos with nobody from the list can go to an
+  *Others* folder.
+- It remembers the names and order, so next time your people are recognised straight away.
+- Private: it all runs on your computer using OpenCV's free face models (a one-time 39 MB download).
+  Your photos are never uploaded. The remembered face data is in `people.json` in the settings folder,
+  and **Forget remembered people** deletes it.
+
 **3 · Results**
 - Searches every folder and sub-folder, several drives at once, with live progress, pause and stop.
 - Tick boxes, sort by any column, type to filter, show one file type at a time.
