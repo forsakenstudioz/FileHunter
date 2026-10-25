@@ -1,0 +1,28 @@
+# Changelog
+
+## 1.1.0 — 2026-10-25
+
+- New **Delete checked…** button: sends the ticked files to the Recycle Bin (Trash on macOS/Linux),
+  or deletes them permanently after a second confirmation.
+- Warns when files are on a pendrive, memory card or network drive (Windows deletes those
+  permanently, there is no Recycle Bin there) and offers to leave program/system files alone.
+
+## 1.0.0 — 2026-10-25
+
+First release.
+
+- Detects every drive: internal disks, partitions, pendrives, SD cards, USB disks, CD/DVD and
+  network drives. New drives appear automatically when plugged in.
+- Tick or untick drives, and add any extra folder to search.
+- Ten ready-made file groups (Images, Videos, Audio, Documents, Archives, Programs, Disk images,
+  Code, Fonts, Ebooks) plus any extensions you type.
+- Filters: name contains (with * and ? wildcards), size range, date modified, hidden files,
+  skip Windows/program/app-data folders.
+- Scans every folder and sub-folder in the background, several drives at once, with pause and stop.
+- Results list with tick boxes, sorting, live search, type filter, image preview,
+  right-click menu, Open and Show in folder.
+- Duplicate finder (compares real file contents) and "tick every extra copy".
+- Copy or move (cut & paste) into one folder, by file type, by month, or keeping the original
+  structure. Name-clash handling, skip identical files, optional verification, free-space check,
+  pause/stop, and undo of the last copy or move.
+- Export results to CSV, copy paths, activity log, light/dark theme.
