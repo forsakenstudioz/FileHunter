@@ -639,6 +639,9 @@ class App(tk.Tk):
         self.btn_go.pack(side="right")
         self.btn_undo = ttk.Button(r2, text="Undo last", command=self._undo)
         self.btn_undo.pack(side="right", padx=(0, 6))
+        self.btn_report = ttk.Button(r2, text="Report", command=self._show_report)
+        self.btn_report.pack(side="right", padx=(0, 6))
+        Tooltip(self.btn_report, "Every file from the last copy or move: which ones were not copied, and why.")
         self.btn_delete = ttk.Button(r2, text="Delete checked…", style="Danger.TButton",
                                      command=self._delete_checked)
         self.btn_delete.pack(side="right", padx=(0, 18))
@@ -1594,6 +1597,11 @@ class App(tk.Tk):
                     "afterwards with \"Undo last\"."
         if not messagebox.askokcancel(APP_NAME, text, parent=self):
             return
+        self._launch_transfer(sel, dest, mode)
+
+    def _launch_transfer(self, sel, dest, mode, layout=None, conflict=None, skip_identical=None,
+                         verify=None):
+        verb = "Move" if mode == "move" else "Copy"
         names = {}
         for k, d in self.drives.items():
             if core.IS_WIN and len(d.path) <= 3:
@@ -1603,9 +1611,11 @@ class App(tk.Tk):
             else:
                 names[k] = d.label or d.name
         self._save_cfg()
-        self.transfer = core.Transfer(sel, dest, mode=mode, layout=self._layout_key(),
-                                      conflict=self._conflict_key(), skip_identical=self.ident_var.get(),
-                                      verify=self.verify_var.get(), drive_names=names)
+        self.transfer = core.Transfer(
+            sel, dest, mode=mode, layout=layout or self._layout_key(),
+            conflict=conflict or self._conflict_key(),
+            skip_identical=self.ident_var.get() if skip_identical is None else skip_identical,
+            verify=self.verify_var.get() if verify is None else verify, drive_names=names)
         self.transfer.start()
         self.xfer_row.grid()
         self.busy = True
@@ -1658,8 +1668,14 @@ class App(tk.Tk):
         stopped = t.stop_ev.is_set()
         msg = (" · ".join(parts) + f" in {dur(t.finished - t.started)}"
                + ("  (stopped)" if stopped else ""))
+        not_copied = sum(1 for e in t.report if e["status"] != "ok")
         bad = c["failed"] or c["partial"]
-        self.xfer_lbl.configure(text=msg + ("  — see Log for details." if bad else ""),
+        self.last_report = {"mode": t.mode, "dest": t.dest, "summary": msg, "rows": t.report,
+                            "items": {it.path: it for it in t.items}, "layout": t.layout,
+                            "conflict": t.conflict, "skip_identical": t.skip_identical,
+                            "verify": t.verify}
+        self.xfer_lbl.configure(text=msg + (f"  — {not_copied:,} not copied, press Report to see them."
+                                            if not_copied else ""),
                                 style="Err.TLabel" if c["failed"] else "Ok.TLabel")
         self.xfer_bar["value"] = 1000 if not stopped else self.xfer_bar["value"]
         self._log(msg)
@@ -1678,7 +1694,13 @@ class App(tk.Tk):
                         self.tree.item(str(i), tags=("moved",))
         self._refresh_counts()
         self._update_buttons()
-        if c["ok"] and not stopped:
+        if not_copied:
+            word = "moved" if t.mode == "move" else "copied"
+            if messagebox.askyesno(APP_NAME, f"{msg}\n\n{not_copied:,} file{'s were' if not_copied != 1 else ' was'} "
+                                             f"not {word}.\nSee which ones and why?", parent=self,
+                                   icon="warning" if bad else "info"):
+                self._show_report()
+        elif c["ok"] and not stopped:
             if messagebox.askyesno(APP_NAME, msg + "\n\nOpen the folder now?", parent=self):
                 open_path(t.dest)
 
@@ -1729,6 +1751,173 @@ class App(tk.Tk):
         self._log(msg)
         self.xfer_lbl.configure(text=msg, style="Err.TLabel" if res["failed"] else "Ok.TLabel")
         self._update_buttons()
+
+    # =============================================================================== report
+    def _show_report(self):
+        rep = getattr(self, "last_report", None)
+        if not rep:
+            messagebox.showinfo(APP_NAME, "Copy or move some files first.", parent=self)
+            return
+        old = getattr(self, "_report_win", None)
+        if old is not None and old.winfo_exists():
+            old.destroy()
+        p, s = self.pal, self.scale
+        win = self._report_win = tk.Toplevel(self)
+        win.title(f"{APP_NAME} · report")
+        win.configure(bg=p["bg"])
+        win.geometry(f"{int(980 * s)}x{int(520 * s)}")
+        win.transient(self)
+        body = ttk.Frame(win, padding=12)
+        body.pack(fill="both", expand=True)
+        body.columnconfigure(0, weight=1)
+        body.rowconfigure(2, weight=1)
+
+        rows = rep["rows"]
+        counts: dict[str, int] = {}
+        for r in rows:
+            counts[r["status"]] = counts.get(r["status"], 0) + 1
+        ttk.Label(body, text=rep["summary"], style="Strong.TLabel").grid(row=0, column=0, sticky="w")
+
+        top = ttk.Frame(body)
+        top.grid(row=1, column=0, sticky="ew", pady=(8, 6))
+        ttk.Label(top, text="Show:").pack(side="left")
+        views = {"Not copied (everything below)": lambda r: r["status"] != "ok"}
+        for key in ("failed", "notreached", "skipped", "identical", "partial", "ok"):
+            if counts.get(key):
+                lab = f"{core.RESULT_LABELS[key]} ({counts[key]:,})"
+                views[lab] = (lambda k: lambda r: r["status"] == k)(key)
+        views["Every file"] = lambda r: True
+        view = tk.StringVar(value=next(iter(views)))
+        cb = ttk.Combobox(top, textvariable=view, values=list(views), state="readonly", width=34)
+        cb.pack(side="left", padx=(6, 0))
+        info = ttk.Label(top, text="", style="Muted.TLabel")
+        info.pack(side="left", padx=(12, 0))
+
+        lf = ttk.Frame(body)
+        lf.grid(row=2, column=0, sticky="nsew")
+        lf.columnconfigure(0, weight=1)
+        lf.rowconfigure(0, weight=1)
+        tv = ttk.Treeview(lf, columns=("result", "reason", "size", "folder"), selectmode="extended")
+        for c, (t, w) in {"#0": ("File", 220), "result": ("Result", 140), "reason": ("Why", 300),
+                          "size": ("Size", 80), "folder": ("Original folder", 320)}.items():
+            tv.heading(c, text=t, anchor="e" if c == "size" else "w")
+            tv.column(c, width=int(w * s), anchor="e" if c == "size" else "w",
+                      stretch=c in ("reason", "folder"))
+        tv.grid(row=0, column=0, sticky="nsew")
+        ys = ttk.Scrollbar(lf, orient="vertical", command=tv.yview)
+        ys.grid(row=0, column=1, sticky="ns")
+        tv.configure(yscrollcommand=ys.set)
+        tv.tag_configure("failed", foreground=p["err"])
+        tv.tag_configure("notreached", foreground=p["warn"])
+        tv.tag_configure("partial", foreground=p["warn"])
+        tv.tag_configure("ok", foreground=p["ok"])
+        tv.tag_configure("muted", foreground=p["muted"])
+        shown: list[dict] = []
+
+        def fill(*_):
+            tv.delete(*tv.get_children())
+            shown.clear()
+            ok = views[view.get()]
+            order = {"failed": 0, "notreached": 1, "partial": 2, "skipped": 3, "identical": 4, "ok": 5}
+            for r in sorted(rows, key=lambda r: (order.get(r["status"], 9), r["src"].lower())):
+                if not ok(r):
+                    continue
+                why = r.get("msg") or ("" if r["status"] != "ok" else "→ " + r.get("dst", ""))
+                tag = r["status"] if r["status"] in ("failed", "notreached", "partial", "ok") else "muted"
+                tv.insert("", "end", iid=str(len(shown)), text=" " + os.path.basename(r["src"]),
+                          values=(core.RESULT_LABELS.get(r["status"], r["status"]), why,
+                                  human_size(r.get("size", 0)), os.path.dirname(r["src"])),
+                          tags=(tag,))
+                shown.append(r)
+            info.configure(text=f"{len(shown):,} file{'s' if len(shown) != 1 else ''}"
+                           if shown else "Nothing here: every file was copied.")
+            sync()
+        cb.bind("<<ComboboxSelected>>", fill)
+
+        def sel_rows():
+            return [shown[int(i)] for i in tv.selection()] or list(shown)
+
+        def retry():
+            todo = [r for r in rows if r["status"] in ("failed", "notreached")]
+            items = [rep["items"][r["src"]] for r in todo if r["src"] in rep["items"]]
+            gone = [it for it in items if not os.path.exists(it.path)]
+            items = [it for it in items if os.path.exists(it.path)]
+            if gone:
+                info.configure(text=f"{len(gone):,} no longer exist and are left out.")
+            if not items:
+                messagebox.showinfo(APP_NAME, "There's nothing left to retry (the files may no longer "
+                                              "exist).", parent=win)
+                return
+            if self.busy:
+                messagebox.showinfo(APP_NAME, "Wait for the current job to finish first.", parent=win)
+                return
+            verb = "move" if rep["mode"] == "move" else "copy"
+            if not messagebox.askokcancel(APP_NAME, f"Try to {verb} these {len(items):,} files again "
+                                                    f"into\n{rep['dest']}?", parent=win):
+                return
+            win.destroy()
+            self._launch_transfer(items, rep["dest"], rep["mode"], layout=rep["layout"],
+                                  conflict=rep["conflict"], skip_identical=rep["skip_identical"],
+                                  verify=rep["verify"])
+
+        def tick_in_results():
+            want = {r["src"] for r in sel_rows()}
+            n = 0
+            for i, it in enumerate(self.items):
+                if it.path in want and not it.gone:
+                    self._toggle(i, True)
+                    n += 1
+            self._refresh_counts()
+            info.configure(text=f"Ticked {n:,} of them in the main list.")
+
+        def export():
+            fp = filedialog.asksaveasfilename(parent=win, defaultextension=".csv",
+                                              initialfile="FileHunter report.csv",
+                                              filetypes=[("CSV (opens in Excel)", "*.csv")])
+            if not fp:
+                return
+            import csv
+            with open(fp, "w", newline="", encoding="utf-8-sig") as fh:
+                w = csv.writer(fh)
+                w.writerow(["File", "Result", "Why", "Size (bytes)", "Original path", "Destination"])
+                for r in shown:
+                    w.writerow([os.path.basename(r["src"]), core.RESULT_LABELS.get(r["status"]),
+                                r.get("msg", ""), r.get("size", 0), r["src"], r.get("dst", "")])
+            info.configure(text=f"Saved {len(shown):,} rows.")
+
+        def copy_list():
+            self.clipboard_clear()
+            self.clipboard_append("\n".join(f"{r['src']}\t{core.RESULT_LABELS.get(r['status'])}\t"
+                                            f"{r.get('msg', '')}" for r in sel_rows()))
+            info.configure(text="Copied to the clipboard.")
+
+        def reveal_sel(_e=None):
+            sel = tv.selection()
+            if sel:
+                r = shown[int(sel[0])]
+                target = r["src"] if os.path.exists(r["src"]) else r.get("dst") or r["src"]
+                reveal(target)
+
+        bar = ttk.Frame(body)
+        bar.grid(row=3, column=0, sticky="ew", pady=(10, 0))
+        b_retry = ttk.Button(bar, text="Retry failed", style="Accent.TButton", command=retry)
+        b_retry.pack(side="left")
+        Tooltip(b_retry, "Tries the failed and not-reached files again with the same settings. "
+                         "Fix the cause first (close the program using the file, free up space, "
+                         "plug the drive back in).")
+        ttk.Button(bar, text="Tick them in the results", command=tick_in_results).pack(side="left", padx=(6, 0))
+        ttk.Button(bar, text="Show in folder", command=reveal_sel).pack(side="left", padx=(6, 0))
+        ttk.Button(bar, text="Close", command=win.destroy).pack(side="right")
+        ttk.Button(bar, text="Export CSV…", command=export).pack(side="right", padx=(0, 6))
+        ttk.Button(bar, text="Copy list", command=copy_list).pack(side="right", padx=(0, 6))
+        tv.bind("<Double-1>", reveal_sel)
+
+        def sync():
+            can = any(r["status"] in ("failed", "notreached") for r in rows)
+            b_retry.state(["!disabled"] if can and not self.busy else ["disabled"])
+        win.bind("<Escape>", lambda e: win.destroy())
+        fill()
+        self._report_tv = tv  # for tests
 
     # =============================================================================== delete
     def _delete_checked(self):
@@ -1902,6 +2091,7 @@ class App(tk.Tk):
             st(w, not moving)
         st(self.btn_go, idle and bool(self.checked))
         st(self.btn_undo, idle and core.last_undoable() is not None)
+        st(self.btn_report, bool(getattr(self, "last_report", None)) and not moving)
         st(self.btn_delete, idle and bool(self.checked))
         st(self.btn_x_pause, moving)
         st(self.btn_x_stop, moving)

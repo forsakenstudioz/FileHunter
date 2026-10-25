@@ -21,7 +21,7 @@ from datetime import datetime
 from pathlib import Path
 
 APP_NAME = "FileHunter"
-VERSION = "1.1.1"
+VERSION = "1.2.0"
 
 IS_WIN = os.name == "nt"
 IS_MAC = sys.platform == "darwin"
@@ -899,6 +899,35 @@ def inside(child: str, parent: str) -> bool:
     return c.startswith(p)
 
 
+RESULT_LABELS = {"ok": "Done", "failed": "Failed", "skipped": "Skipped",
+                 "identical": "Already there", "partial": "Copied, original kept",
+                 "notreached": "Not copied (stopped)"}
+
+
+def friendly_error(e: BaseException) -> str:
+    """Turn an OS error into a sentence a person understands."""
+    import errno
+    w = getattr(e, "winerror", None)
+    no = getattr(e, "errno", None)
+    if w in (32, 33):
+        return "the file is open in another program"
+    if w in (39, 112) or no == errno.ENOSPC:
+        return "the destination drive is full"
+    if w == 5 or isinstance(e, PermissionError):
+        return "no permission (the file or folder is protected or read-only)"
+    if w in (2, 3) or isinstance(e, FileNotFoundError):
+        return "the file or folder no longer exists"
+    if w == 206 or no == errno.ENAMETOOLONG:
+        return "the name or path is too long"
+    if w in (21, 23, 1117, 1167) or no in (errno.EIO, errno.ENODEV, getattr(errno, "ENXIO", -1)):
+        return "the drive could not be read or written (unplugged or damaged?)"
+    if w == 123:
+        return "the file name contains characters the destination does not allow"
+    if isinstance(e, OSError):
+        return e.strerror or str(e)
+    return str(e)
+
+
 class Transfer:
     """Copies or moves files with live progress, pause/stop, verification and a journal."""
 
@@ -924,6 +953,7 @@ class Transfer:
         self.done = False
         self.started = self.finished = 0.0
         self.log: list[str] = []
+        self.report: list[dict] = []
         self._by_size: dict[int, list[str]] = {}   # everything already in the destination
         self._hash_cache: dict[tuple[str, bool], str | None] = {}
 
@@ -1006,7 +1036,7 @@ class Transfer:
             try:
                 self._one(it, entry)
             except Exception as e:  # noqa: BLE001
-                entry["status"], entry["msg"] = "failed", str(e)
+                entry["status"], entry["msg"] = "failed", friendly_error(e)
             if entry["status"] == "stopped":
                 break
             self._note(entry)
@@ -1014,6 +1044,12 @@ class Transfer:
                     and it.size > 0:
                 self._by_size.setdefault(it.size, []).append(_long(entry["dst"]))
             self.done_bytes = sum(i.size for i in self.items[: idx + 1])
+        # files never reached (Stop pressed) belong in the report too
+        seen = {e["src"] for e in self.journal}
+        self.report = [dict(e) for e in self.journal] + [
+            {"op": self.mode, "src": it.path, "dst": "", "size": it.size, "status": "notreached",
+             "msg": "not copied: stopped before this file was reached"}
+            for it in self.items if it.path not in seen]
         self.finished = time.time()
         self.done = True
         save_history(self)
@@ -1031,7 +1067,7 @@ class Transfer:
             same = self._find_identical(src, it.size)
             if same:
                 entry["status"], entry["dst"] = "identical", same
-                entry["msg"] = f"identical file already there: {os.path.basename(same)}"
+                entry["msg"] = f"same file already in the destination: {os.path.relpath(same, _long(self.dest))}"
                 return
         os.makedirs(_long(os.path.dirname(dst)), exist_ok=True)
         if os.path.exists(_long(dst)):
@@ -1355,7 +1391,7 @@ class Deleter:
                                 os.chmod(_long(p), stat.S_IWRITE | stat.S_IREAD)
                                 os.remove(_long(p))
                             except OSError as e:
-                                self.results[p] = e.strerror or str(e)
+                                self.results[p] = friendly_error(e)
                     elif IS_WIN:
                         _win_recycle(chunk)
                     elif IS_MAC:
@@ -1363,7 +1399,7 @@ class Deleter:
                     else:
                         _linux_trash_one(chunk[0])
                 except Exception as e:  # noqa: BLE001
-                    err = getattr(e, "strerror", None) or str(e)
+                    err = friendly_error(e)
                 for p in chunk:
                     if p in self.results:
                         continue

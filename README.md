@@ -47,6 +47,9 @@ want, and copy or move it all into one place.
   Identical files that are already there are skipped automatically.
 - Checks free space first, shows speed and time left, can pause and stop
   (a half-copied file is always cleaned up), and can double-check every copy.
+- **Report** shows every file that was *not* copied and why (file open in another program, drive full,
+  no permission, already there…). **Retry failed** tries them again once you've fixed the cause, and the
+  list can be exported to CSV.
 - **Undo last** puts moved files back where they came from, or removes the copies it made.
 - Warns before moving anything out of Windows or program folders, which could break programs.
 - **Delete checked…** sends the ticked files to the Recycle Bin (or Trash), where you can restore them,

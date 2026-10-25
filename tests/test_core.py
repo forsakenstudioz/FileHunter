@@ -170,3 +170,24 @@ def test_skip_identical_by_contents_across_runs(tmp_path):
     files = [f for _, _, fs in os.walk(dest) for f in fs]
     assert len(files) == 2  # renamed.jpg + one copy of the "A" photo, nothing more
     assert os.path.exists(a)
+
+
+def test_report_lists_failures_and_not_reached(tmp_path):
+    a = mk(str(tmp_path / "s" / "a.mp3"), b"a" * 10)
+    b = mk(str(tmp_path / "s" / "b.mp3"), b"b" * 10)
+    items = [core.FileItem(p, os.path.basename(p), "mp3", 10, 0, str(tmp_path / "s")) for p in (a, b)]
+    os.remove(a)
+    t = core.Transfer(items, str(tmp_path / "d"))
+    t.run()
+    assert [(r["status"], r["msg"]) for r in t.report][0] == ("failed", "file no longer exists")
+    assert t.report[1]["status"] == "ok"
+    t = core.Transfer(items, str(tmp_path / "d2"))
+    t.stop()
+    t.run()
+    assert [r["status"] for r in t.report] == ["notreached", "notreached"]
+
+
+def test_friendly_errors():
+    import errno
+    assert "full" in core.friendly_error(OSError(errno.ENOSPC, "x"))
+    assert "permission" in core.friendly_error(PermissionError(errno.EACCES, "x"))

@@ -1,5 +1,14 @@
 # Changelog
 
+## 1.2.0 — 2026-10-25
+
+- New **Report** after every copy or move: lists each file that was not copied (failed, skipped,
+  already there, or not reached because you pressed Stop) with the reason in plain words —
+  "the file is open in another program", "the destination drive is full", "no permission"…
+- **Retry failed** tries those files again with the same settings once you've fixed the cause.
+- From the report: tick the files in the results list, show them in their folder, copy the list
+  or export it to CSV. FileHunter offers to open the report automatically when something wasn't copied.
+
 ## 1.1.1 — 2026-10-25
 
 - Fixed **Skip files that are already there**: it now compares file *contents* with everything already
