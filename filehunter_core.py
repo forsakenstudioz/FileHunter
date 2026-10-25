@@ -21,7 +21,7 @@ from datetime import datetime
 from pathlib import Path
 
 APP_NAME = "FileHunter"
-VERSION = "1.1.0"
+VERSION = "1.1.1"
 
 IS_WIN = os.name == "nt"
 IS_MAC = sys.platform == "darwin"
@@ -924,6 +924,44 @@ class Transfer:
         self.done = False
         self.started = self.finished = 0.0
         self.log: list[str] = []
+        self._by_size: dict[int, list[str]] = {}   # everything already in the destination
+        self._hash_cache: dict[tuple[str, bool], str | None] = {}
+
+    # -- "is this file already somewhere in the destination?"
+    def _index_destination(self):
+        for root, _dirs, files in os.walk(_long(self.dest)):
+            for name in files:
+                if name.endswith(".fhpart"):
+                    continue
+                p = os.path.join(root, name)
+                try:
+                    size = os.path.getsize(p)
+                except OSError:
+                    continue
+                if size > 0:
+                    self._by_size.setdefault(size, []).append(p)
+
+    def _hash(self, path: str, quick: bool) -> str | None:
+        key = (path, quick)
+        if key not in self._hash_cache:
+            self._hash_cache[key] = _hash_file(path, self.stop_ev, quick=quick)
+        return self._hash_cache[key]
+
+    def _find_identical(self, src: str, size: int) -> str | None:
+        """Path of a file in the destination with exactly the same contents, if any."""
+        cands = [p for p in self._by_size.get(size, ())
+                 if os.path.normcase(p) != os.path.normcase(_long(src))]
+        if not cands:
+            return None
+        q = self._hash(_long(src), True)
+        if q is None:
+            return None
+        for c in cands:
+            if self._hash(c, True) != q:
+                continue
+            if size <= 131072 or self._hash(c, False) == self._hash(_long(src), False):
+                return c
+        return None
 
     def pause(self):
         self.run_ev.clear()
@@ -954,6 +992,9 @@ class Transfer:
     def run(self):
         self.started = time.time()
         os.makedirs(self.dest, exist_ok=True)
+        if self.skip_identical:
+            self.current = "Checking what is already in the destination…"
+            self._index_destination()
         for idx, it in enumerate(self.items):
             self.index = idx
             if self.stop_ev.is_set():
@@ -969,6 +1010,9 @@ class Transfer:
             if entry["status"] == "stopped":
                 break
             self._note(entry)
+            if self.skip_identical and entry["status"] in ("ok", "partial") and entry["dst"] \
+                    and it.size > 0:
+                self._by_size.setdefault(it.size, []).append(_long(entry["dst"]))
             self.done_bytes = sum(i.size for i in self.items[: idx + 1])
         self.finished = time.time()
         self.done = True
@@ -983,9 +1027,15 @@ class Transfer:
         if os.path.normcase(os.path.abspath(dst)) == os.path.normcase(os.path.abspath(src)):
             entry["status"], entry["msg"], entry["dst"] = "skipped", "already in place", dst
             return
+        if self.skip_identical and it.size > 0:
+            same = self._find_identical(src, it.size)
+            if same:
+                entry["status"], entry["dst"] = "identical", same
+                entry["msg"] = f"identical file already there: {os.path.basename(same)}"
+                return
         os.makedirs(_long(os.path.dirname(dst)), exist_ok=True)
         if os.path.exists(_long(dst)):
-            if self.skip_identical and same_content(src, dst):
+            if self.skip_identical and it.size == 0 and same_content(src, dst):
                 entry["status"], entry["msg"], entry["dst"] = "identical", \
                     "identical file already there", dst
                 return

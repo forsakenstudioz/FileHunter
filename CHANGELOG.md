@@ -1,5 +1,11 @@
 # Changelog
 
+## 1.1.1 — 2026-10-25
+
+- Fixed **Skip files that are already there**: it now compares file *contents* with everything already
+  in the destination folder (any name, any sub-folder). Before, it only checked a file with exactly the
+  same name, so running the same copy again could create `photo (3).jpg`, `photo (4).jpg`…
+
 ## 1.1.0 — 2026-10-25
 
 - New **Delete checked…** button: sends the ticked files to the Recycle Bin (Trash on macOS/Linux),

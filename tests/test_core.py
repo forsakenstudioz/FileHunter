@@ -85,8 +85,11 @@ def test_copy_rename_and_identical_skip(tree, tmp_path):
     dest = str(tmp_path / "out")
     t = core.Transfer(items, dest, mode="copy", verify=True)
     t.run()
-    assert t.counts["ok"] == 3
-    assert len(os.listdir(dest)) == 3
+    assert t.counts["ok"] == 2 and t.counts["identical"] == 1  # buried.img == copy.IMG
+    assert len(os.listdir(dest)) == 2
+    t = core.Transfer(items, str(tmp_path / "out2"), mode="copy", skip_identical=False)
+    t.run()
+    assert t.counts["ok"] == 3  # name clash -> "copy (2).img" on case-insensitive systems
     t = core.Transfer(items, dest, mode="copy")
     t.run()
     assert t.counts["identical"] == 3
@@ -97,7 +100,7 @@ def test_move_and_undo(tree, tmp_path):
     items = core.Scanner([tree], core.ScanFilters(exts=["img"])).run_blocking()
     before = {i.path: open(i.path, "rb").read() for i in items}
     dest = str(tmp_path / "moved")
-    t = core.Transfer(items, dest, mode="move", layout="keep")
+    t = core.Transfer(items, dest, mode="move", layout="keep", skip_identical=False)
     t.run()
     assert t.counts["ok"] == 3
     assert not any(os.path.exists(p) for p in before)
@@ -151,3 +154,19 @@ def test_linux_trash(tmp_path, monkeypatch):
     assert files == ["song one.2.mp3", "song one.mp3"]
     info = (tmp_path / "share" / "Trash" / "info" / "song one.mp3.trashinfo").read_text()
     assert "Path=" in info and "song%20one.mp3" in info and "DeletionDate=" in info
+
+
+def test_skip_identical_by_contents_across_runs(tmp_path):
+    src = tmp_path / "src"
+    a = mk(str(src / "a" / "photo.jpg"), b"A" * 4000)
+    mk(str(src / "b" / "photo.jpg"), b"B" * 4000)       # same name, different contents
+    mk(str(src / "c" / "holiday.jpg"), b"A" * 4000)     # same contents as a, other name
+    dest = tmp_path / "dest"
+    mk(str(dest / "old" / "renamed.jpg"), b"B" * 4000)  # already there under another name
+    items = core.Scanner([str(src)], core.ScanFilters(exts=["jpg"])).run_blocking()
+    for _ in range(3):
+        t = core.Transfer(items, str(dest))
+        t.run()
+    files = [f for _, _, fs in os.walk(dest) for f in fs]
+    assert len(files) == 2  # renamed.jpg + one copy of the "A" photo, nothing more
+    assert os.path.exists(a)
