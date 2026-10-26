@@ -32,9 +32,12 @@ PHOTO_EXTS = {"jpg", "jpeg", "png", "bmp", "webp", "tif", "tiff", "jfif"}
 SAME_PERSON = 0.40
 MERGE_PEOPLE = 0.42
 KNOWN_PERSON = 0.45
-MIN_FACE_PX = 20        # ignore faces smaller than this (tiny background faces)
+MIN_FACE_PX = 24        # ignore faces smaller than this (tiny background faces)
 MIN_SCORE = 0.85        # detector confidence
-MAX_SIDE = 1600         # photos are shrunk to this before searching for faces
+MAX_SIDE = 1280         # photos are shrunk to this before searching for faces
+MAX_FACES_PER_PHOTO = 24  # in a crowd, only the biggest faces are recognised
+THUMB = 64              # face thumbnail size in pixels
+CACHE_VERSION = 2       # bump when face finding changes, so old cached results are redone
 
 
 # ----------------------------------------------------------------------------- availability
@@ -169,10 +172,12 @@ def load_image(path: str):
         from PIL import Image, ImageOps
         with Image.open(core._long(path)) as im:
             try:
-                im.draft("RGB", (MAX_SIDE, MAX_SIDE))
+                im.draft("RGB", (MAX_SIDE, MAX_SIDE))  # JPEG: decode at 1/2, 1/4 … size (much faster)
             except Exception:  # noqa: BLE001
                 pass
             im = ImageOps.exif_transpose(im)
+            if max(im.size) > MAX_SIDE:
+                im.thumbnail((MAX_SIDE, MAX_SIDE), Image.BILINEAR)
             im = im.convert("RGB")
             img = cv2.cvtColor(np.asarray(im), cv2.COLOR_RGB2BGR)
     except ImportError:
@@ -181,7 +186,7 @@ def load_image(path: str):
         img = None
     if img is None:
         data = np.fromfile(core._long(path), dtype=np.uint8)
-        img = cv2.imdecode(data, cv2.IMREAD_COLOR)
+        img = cv2.imdecode(data, cv2.IMREAD_REDUCED_COLOR_2 if data.size > 3_000_000 else cv2.IMREAD_COLOR)
     if img is None:
         raise OSError("this image could not be read")
     h, w = img.shape[:2]
@@ -189,6 +194,17 @@ def load_image(path: str):
     if s < 1:
         img = cv2.resize(img, (max(1, int(w * s)), max(1, int(h * s))), interpolation=cv2.INTER_AREA)
     return img
+
+
+def thumb_png(data: bytes) -> bytes:
+    """Face thumbnails are kept as small JPEGs; Tk needs PNG to show them."""
+    if not data or data[:4] == b"\x89PNG":
+        return data
+    import numpy as np
+    import cv2
+    im = cv2.imdecode(np.frombuffer(data, np.uint8), cv2.IMREAD_COLOR)
+    ok, png = cv2.imencode(".png", im)
+    return png.tobytes() if ok else b""
 
 
 class FaceEngine:
@@ -208,11 +224,10 @@ class FaceEngine:
         out = []
         if found is None:
             return out
-        for row in found:
+        rows = [r for r in found if float(r[-1]) >= MIN_SCORE and min(r[2], r[3]) >= MIN_FACE_PX]
+        rows.sort(key=lambda r: -float(min(r[2], r[3])))
+        for row in rows[:MAX_FACES_PER_PHOTO]:   # in a crowd, only the biggest faces matter
             x, y, fw, fh = (int(v) for v in row[:4])
-            score = float(row[-1])
-            if score < MIN_SCORE or min(fw, fh) < MIN_FACE_PX:
-                continue
             aligned = self.rec.alignCrop(img, row)
             emb = self.rec.feature(aligned).flatten().astype("float32")
             emb /= (np.linalg.norm(emb) + 1e-9)
@@ -222,32 +237,133 @@ class FaceEngine:
             crop = img[y0:y1, x0:x1]
             if crop.size == 0:
                 crop = aligned
-            side = 72
+            side = THUMB
             ch, cw = crop.shape[:2]
             s = side / max(ch, cw)
             crop = cv2.resize(crop, (max(1, int(cw * s)), max(1, int(ch * s))), interpolation=cv2.INTER_AREA)
             canvas = np.full((side, side, 3), 255, dtype=np.uint8)
             oy, ox = (side - crop.shape[0]) // 2, (side - crop.shape[1]) // 2
             canvas[oy:oy + crop.shape[0], ox:ox + crop.shape[1]] = crop
-            ok, png = cv2.imencode(".png", canvas)
-            out.append(Face(photo=path, box=(x, y, fw, fh), score=score, emb=emb,
-                            thumb=png.tobytes() if ok else b""))
+            ok, jpg = cv2.imencode(".jpg", canvas, [cv2.IMWRITE_JPEG_QUALITY, 85])
+            out.append(Face(photo=path, box=(x, y, fw, fh), score=float(row[-1]), emb=emb,
+                            thumb=jpg.tobytes() if ok else b""))
         return out
 
 
-class FaceScan:
-    """Looks for faces in many photos in a background thread."""
+# ----------------------------------------------------------------------------- results cache
+class FaceCache:
+    """Remembers the faces found in each photo (keyed by path, size and date), so scanning the
+    same photos again is instant and a stopped scan carries on where it left off."""
 
-    def __init__(self, paths: list[str]):
-        self.paths = list(paths)
+    def __init__(self, path: str | None = None):
+        import sqlite3
+        self.path = path or os.path.join(str(core.config_dir()), "faces_cache.db")
+        self.db = sqlite3.connect(self.path, check_same_thread=False)
+        self.lock = threading.Lock()
+        with self.lock:
+            self.db.executescript(
+                "PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL;"
+                "CREATE TABLE IF NOT EXISTS photos (path TEXT PRIMARY KEY, size INT, mtime REAL,"
+                " nfaces INT, err TEXT, ver INT);"
+                "CREATE TABLE IF NOT EXISTS faces (path TEXT, x INT, y INT, w INT, h INT, score REAL,"
+                " emb BLOB, thumb BLOB);"
+                "CREATE INDEX IF NOT EXISTS faces_path ON faces(path);")
+
+    @staticmethod
+    def _sig(path: str):
+        st = os.stat(core._long(path))
+        return st.st_size, round(st.st_mtime, 2)
+
+    def lookup(self, paths: list[str]):
+        """{path: (faces, err)} for photos already analysed and unchanged since."""
+        import numpy as np
+        known = {}
+        with self.lock:
+            rows = self.db.execute("SELECT path, size, mtime, nfaces, err FROM photos WHERE ver=?",
+                                   (CACHE_VERSION,)).fetchall()
+        meta = {r[0]: r[1:] for r in rows}
+        hits = []
+        for p in paths:
+            m = meta.get(p)
+            if not m:
+                continue
+            try:
+                if self._sig(p) != (m[0], m[1]):
+                    continue
+            except OSError:
+                continue
+            hits.append(p)
+        out = {p: ([], meta[p][3]) for p in hits}
+        for i in range(0, len(hits), 500):
+            chunk = hits[i:i + 500]
+            with self.lock:
+                fr = self.db.execute(
+                    f"SELECT path, x, y, w, h, score, emb, thumb FROM faces WHERE path IN "
+                    f"({','.join('?' * len(chunk))})", chunk).fetchall()
+            for path, x, y, w, h, score, emb, thumb in fr:
+                out[path][0].append(Face(photo=path, box=(x, y, w, h), score=score,
+                                         emb=np.frombuffer(emb, dtype="float32").copy(), thumb=thumb))
+        return out
+
+    def store(self, results: list[tuple[str, list, str]]):
+        rows, frows, paths = [], [], []
+        for path, fs, err in results:
+            try:
+                size, mtime = self._sig(path)
+            except OSError:
+                continue
+            paths.append(path)
+            rows.append((path, size, mtime, len(fs), err or None, CACHE_VERSION))
+            for f in fs:
+                frows.append((path, *f.box, f.score, f.emb.astype("float32").tobytes(), f.thumb))
+        if not rows:
+            return
+        with self.lock:
+            self.db.executemany("DELETE FROM faces WHERE path=?", [(p,) for p in paths])
+            self.db.executemany("INSERT OR REPLACE INTO photos VALUES (?,?,?,?,?,?)", rows)
+            self.db.executemany("INSERT INTO faces VALUES (?,?,?,?,?,?,?,?)", frows)
+            self.db.commit()
+
+    def close(self):
+        try:
+            with self.lock:
+                self.db.close()
+        except Exception:  # noqa: BLE001
+            pass
+
+
+def clear_cache():
+    for suffix in ("", "-wal", "-shm"):
+        try:
+            os.remove(os.path.join(str(core.config_dir()), "faces_cache.db" + suffix))
+        except OSError:
+            pass
+
+
+def default_workers() -> int:
+    n = os.cpu_count() or 2
+    return max(2, min(6, n // 2)) if n >= 2 else 1
+
+
+class FaceScan:
+    """Looks for faces in many photos, on several processor cores, in the background."""
+
+    def __init__(self, paths: list[str], workers: int | None = None, use_cache: bool = True):
+        self.paths = list(dict.fromkeys(paths))
+        self.workers = workers or default_workers()
+        self.use_cache = use_cache
         self.faces: list[Face] = []
         self.no_face: list[str] = []
         self.errors: dict[str, str] = {}
+        self.done_paths: list[str] = []
+        self.from_cache = 0
         self.done_count = 0
         self.current = ""
+        self.stage = "Starting…"
         self.stop_ev = threading.Event()
         self.run_ev = threading.Event()
         self.run_ev.set()
+        self._lock = threading.Lock()
         self.done = False
         self.started = self.finished = 0.0
         self.fatal = ""
@@ -269,118 +385,236 @@ class FaceScan:
     def paused(self):
         return not self.run_ev.is_set()
 
+    def _record(self, path, fs, err):
+        with self._lock:
+            if err:
+                self.errors[path] = err
+            elif fs:
+                self.faces.extend(fs)
+            else:
+                self.no_face.append(path)
+            self.done_paths.append(path)
+            self.done_count += 1
+
     def run(self):
         self.started = time.time()
+        cache = None
         try:
-            eng = FaceEngine()
+            todo = self.paths
+            if self.use_cache:
+                self.stage = "Checking photos already analysed…"
+                try:
+                    cache = FaceCache()
+                    hits = cache.lookup(self.paths)
+                except Exception:  # noqa: BLE001 - a broken cache must never stop the scan
+                    cache, hits = None, {}
+                for p, (fs, err) in hits.items():
+                    self._record(p, fs, err)
+                self.from_cache = len(hits)
+                todo = [p for p in self.paths if p not in hits]
+            self.stage = "Looking for faces"
+            if todo and not self.stop_ev.is_set():
+                self._analyse(todo, cache)
         except Exception as e:  # noqa: BLE001
-            self.fatal = f"The face models could not be loaded: {e}"
+            self.fatal = f"Face search stopped: {e}"
+        finally:
+            if cache is not None:
+                cache.close()
+            self.finished = time.time()
             self.done = True
-            return
-        for p in self.paths:
-            if self.stop_ev.is_set():
-                break
-            self.run_ev.wait()
-            self.current = p
+
+    def _analyse(self, todo, cache):
+        import cv2
+        n = max(1, min(self.workers, len(todo)))
+        try:  # share the processor cores between the workers instead of each grabbing all of them
+            cv2.setNumThreads(max(1, (os.cpu_count() or 2) // n))
+        except Exception:  # noqa: BLE001
+            pass
+        engines = []
+        try:
+            engines = [FaceEngine() for _ in range(n)]
+        except Exception as e:  # noqa: BLE001
+            if not engines:
+                self.fatal = f"The face models could not be loaded: {e}"
+                return
+        queue_ = list(reversed(todo))
+        qlock = threading.Lock()
+        pending: list = []
+        plock = threading.Lock()
+
+        def flush(force=False):
+            if cache is None:
+                return
+            with plock:
+                if not pending or (not force and len(pending) < 40):
+                    return
+                batch = pending[:]
+                pending.clear()
             try:
-                fs = eng.faces_in(p)
-                if fs:
-                    self.faces.extend(fs)
-                else:
-                    self.no_face.append(p)
-            except Exception as e:  # noqa: BLE001
-                self.errors[p] = core.friendly_error(e) if isinstance(e, OSError) else str(e)
-            self.done_count += 1
-        self.finished = time.time()
-        self.done = True
+                cache.store(batch)
+            except Exception:  # noqa: BLE001
+                pass
+
+        def worker(eng):
+            while not self.stop_ev.is_set():
+                self.run_ev.wait()
+                with qlock:
+                    if not queue_:
+                        return
+                    p = queue_.pop()
+                self.current = p
+                try:
+                    fs, err = eng.faces_in(p), ""
+                except Exception as e:  # noqa: BLE001
+                    fs, err = [], (core.friendly_error(e) if isinstance(e, OSError) else str(e)) or "unreadable"
+                self._record(p, fs, err)
+                with plock:
+                    pending.append((p, fs, err))
+                flush()
+
+        threads = [threading.Thread(target=worker, args=(e,), daemon=True) for e in engines]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+        flush(force=True)
 
 
 # ----------------------------------------------------------------------------- grouping
-def _threshold(f: Face) -> float:
+def _thresholds(sizes):
     """Small faces carry less detail, so they need a closer match to count as the same person."""
-    side = min(f.box[2], f.box[3])
-    if side >= 60:
-        return SAME_PERSON
-    if side >= 36:
-        return SAME_PERSON + 0.06
-    return SAME_PERSON + 0.12
+    import numpy as np
+    sizes = np.asarray(sizes)
+    return np.where(sizes >= 60, SAME_PERSON, np.where(sizes >= 36, SAME_PERSON + 0.06, SAME_PERSON + 0.12))
 
-def group_faces(faces: list[Face], known: list[dict] | None = None) -> list[Person]:
+
+def group_faces(faces: list[Face], known: list[dict] | None = None, progress=None,
+                stop: threading.Event | None = None) -> list[Person]:
     """Put faces of the same person together. Biggest groups first.
 
+    Fast enough for 100,000+ faces: every face is compared with each group's average face (one
+    matrix product), then similar groups are joined in blocks. progress(done, total, text).
     known: people remembered from earlier runs [{"name", "centroid"}]; matching groups get their
     names and keep the remembered order (priority).
     """
     import numpy as np
+    n = len(faces)
+    if not n:
+        return []
+    E = np.stack([f.emb for f in faces]).astype("float32")
+    E /= np.linalg.norm(E, axis=1, keepdims=True) + 1e-9
+    sizes = [min(f.box[2], f.box[3]) for f in faces]
+    thr = _thresholds(sizes)
+    order = sorted(range(n), key=lambda i: -faces[i].quality)
+
+    cap = 1024
+    C = np.zeros((cap, E.shape[1]), dtype="float32")     # average face of each group (unit length)
+    SUM = np.zeros((cap, E.shape[1]), dtype="float32")   # sum of the faces in each group
+    members: list[list[int]] = []
+    photos: list[set] = []
+    k = 0
+    for step, i in enumerate(order):
+        if stop is not None and stop.is_set():
+            break
+        if progress and step % 2000 == 0:
+            progress(step, n, "Grouping faces into people")
+        e, photo = E[i], faces[i].photo
+        g = -1
+        if k:
+            sims = C[:k] @ e
+            cand = np.flatnonzero(sims >= thr[i])
+            if cand.size:
+                for c in cand[np.argsort(-sims[cand])]:
+                    if photo not in photos[c]:   # one person can't be in the same photo twice
+                        g = int(c)
+                        break
+        if g < 0:
+            if k == cap:
+                cap *= 2
+                C = np.vstack([C, np.zeros_like(C)])
+                SUM = np.vstack([SUM, np.zeros_like(SUM)])
+            g = k
+            k += 1
+            members.append([])
+            photos.append(set())
+        members[g].append(i)
+        photos[g].add(photo)
+        SUM[g] += e
+        C[g] = SUM[g] / (np.linalg.norm(SUM[g]) + 1e-9)
+
+    # join groups that turned out to be the same person (compared block by block: low memory)
+    if progress:
+        progress(n, n, "Joining groups of the same person")
+    G = C[:k]
+    pairs = []
+    B = 2048
+    for a in range(0, k, B):
+        if stop is not None and stop.is_set():
+            break
+        S = G[a:a + B] @ G[a:].T
+        ii, jj = np.nonzero(S >= MERGE_PEOPLE)
+        for x, y in zip(ii.tolist(), jj.tolist()):
+            gi, gj = a + x, a + y
+            if gj > gi:
+                pairs.append((float(S[x, y]), gi, gj))
+    pairs.sort(reverse=True)
+    parent = list(range(k))
+
+    def find(x):
+        while parent[x] != x:
+            parent[x] = parent[parent[x]]
+            x = parent[x]
+        return x
+    for _s, a_, b_ in pairs:
+        ra, rb = find(a_), find(b_)
+        if ra == rb or photos[ra] & photos[rb]:   # never join two people seen in the same photo
+            continue
+        ca = SUM[ra] / (np.linalg.norm(SUM[ra]) + 1e-9)
+        cb = SUM[rb] / (np.linalg.norm(SUM[rb]) + 1e-9)
+        if float(ca @ cb) < MERGE_PEOPLE:          # the groups drifted apart while joining others
+            continue
+        if len(members[rb]) > len(members[ra]):
+            ra, rb = rb, ra
+        parent[rb] = ra
+        members[ra] += members[rb]
+        photos[ra] |= photos[rb]
+        SUM[ra] += SUM[rb]
+        members[rb] = []
+
     people: list[Person] = []
-    cents: list = []
-    in_photos: list[set] = []   # photos each group already has a face in
-    for f in sorted(faces, key=lambda f: -f.quality):
-        f.person = -1
-        need = _threshold(f)
-        if cents:
-            sims = np.asarray(cents) @ f.emb
-            for best in np.argsort(-sims):
-                if sims[best] < need:
-                    break
-                if f.photo in in_photos[best]:
-                    continue  # one person can't be in the same photo twice
-                p = people[best]
-                p.faces.append(f)
-                in_photos[best].add(f.photo)
-                c = np.mean([x.emb for x in p.faces], axis=0)
-                cents[best] = c / (np.linalg.norm(c) + 1e-9)
-                break
-            else:
-                best = None
-            if best is not None and f in people[best].faces:
-                continue
-        people.append(Person(pid=len(people), faces=[f]))
-        cents.append(f.emb.copy())
-        in_photos.append({f.photo})
-    for p, c in zip(people, cents):
-        p.centroid = c
-    # merge groups that turned out to be the same person
-    merged = True
-    while merged and len(people) > 1:
-        merged = False
-        C = np.asarray([p.centroid for p in people])
-        S = C @ C.T
-        np.fill_diagonal(S, -1)
-        for a_i in range(len(people)):           # never merge two people seen in the same photo
-            for b_i in range(a_i + 1, len(people)):
-                if people[a_i].photos & people[b_i].photos:
-                    S[a_i, b_i] = S[b_i, a_i] = -1
-        i, j = np.unravel_index(int(np.argmax(S)), S.shape)
-        if S[i, j] >= MERGE_PEOPLE:
-            a, b = (i, j) if len(people[i].faces) >= len(people[j].faces) else (j, i)
-            people[a].faces += people[b].faces
-            people[a].update_centroid()
-            del people[b]
-            merged = True
-    people.sort(key=lambda p: (-len(p.photos), -max(f.quality for f in p.faces)))
+    for g in range(k):
+        if find(g) != g or not members[g]:
+            continue
+        p = Person(pid=0, faces=[faces[i] for i in members[g]])
+        p.centroid = SUM[g] / (np.linalg.norm(SUM[g]) + 1e-9)
+        p._nphotos = len(photos[g])
+        people.append(p)
+    people.sort(key=lambda p: (-p._nphotos, -max(f.quality for f in p.faces)))
     # names and priority from earlier runs
-    order = {}
-    for kn_i, kn in enumerate(known or []):
-        kc = np.asarray(kn["centroid"], dtype="float32")
-        best, best_s = None, KNOWN_PERSON
-        for p in people:
-            if p.known:
-                continue
-            s = float(p.centroid @ kc)
-            if s >= best_s:
-                best, best_s = p, s
-        if best is not None:
-            best.name, best.known = kn["name"], True
-            best.include = kn.get("include", True)
-            order[id(best)] = kn_i
-    people.sort(key=lambda p: (0, order[id(p)]) if id(p) in order else (1, 0))
-    for n, p in enumerate(people):
-        p.pid = n
+    order_known = {}
+    if known and people:
+        P = np.stack([p.centroid for p in people])
+        for kn_i, kn in enumerate(known):
+            kc = np.asarray(kn["centroid"], dtype="float32")
+            sims = P @ kc
+            for idx in np.argsort(-sims):
+                if sims[idx] < KNOWN_PERSON:
+                    break
+                p = people[int(idx)]
+                if not p.known:
+                    p.name, p.known = kn["name"], True
+                    p.include = kn.get("include", True)
+                    order_known[id(p)] = kn_i
+                    break
+    people.sort(key=lambda p: (0, order_known[id(p)]) if id(p) in order_known else (1, 0))
+    for num, p in enumerate(people):
+        p.pid = num
         if not p.name:
-            p.name = f"Person {n + 1}"
+            p.name = f"Person {num + 1}"
         for f in p.faces:
-            f.person = n
+            f.person = num
+    if progress:
+        progress(n, n, "Done")
     return people
 
 

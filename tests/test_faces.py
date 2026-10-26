@@ -94,3 +94,29 @@ def test_remembered_people_keep_name_and_order():
 def test_folder_names_are_safe_and_unique():
     ps = [faces.Person(pid=i, name=n) for i, n in enumerate(["Ravi", "ravi", "A/B:C"])]
     assert faces.folder_names(ps) == ["Ravi", "ravi (2)", "A_B_C"]
+
+
+def test_grouping_many_faces_is_fast():
+    import time
+    rng = np.random.default_rng(5)
+    ids = rng.normal(size=(3000, 128)).astype("float32")
+    fs = [face(f"p{i // 3}.jpg", ids[i % 3000] / np.linalg.norm(ids[i % 3000]), i) for i in range(12000)]
+    t = time.time()
+    people = faces.group_faces(fs)
+    assert time.time() - t < 20
+    assert 2500 <= len(people) <= 3500
+
+
+def test_saved_results_are_reused_and_refreshed(tmp_path):
+    p = tmp_path / "a.jpg"
+    p.write_bytes(b"x")
+    f = face(str(p), person_vec(1), 1)
+    f.thumb = b"jpg"
+    cache = faces.FaceCache(str(tmp_path / "c.db"))
+    cache.store([(str(p), [f], ""), (str(tmp_path / "gone.jpg"), [], "")])
+    hit = cache.lookup([str(p)])
+    assert list(hit) == [str(p)] and len(hit[str(p)][0]) == 1
+    assert np.allclose(hit[str(p)][0][0].emb, f.emb) and hit[str(p)][0][0].thumb == b"jpg"
+    p.write_bytes(b"changed photo")           # edited photo: must be looked at again
+    assert cache.lookup([str(p)]) == {}
+    cache.close()

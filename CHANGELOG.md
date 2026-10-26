@@ -1,5 +1,17 @@
 # Changelog
 
+## 1.3.1 — 2026-10-26
+
+- Fixed **Sort by faces** freezing ("Not responding") after the face search finished. Grouping the faces
+  into people ran inside the window and slowed down sharply with big collections (35 s for 19,000 faces,
+  many minutes or out of memory beyond that). It now runs in the background with a progress bar and
+  takes under a second for 19,000 faces, about 10 s for 60,000.
+- Face search is faster: it uses several processor cores, reads photos at a smaller size, skips tiny
+  background faces and recognises at most the 24 biggest faces in a crowd photo.
+- Results are saved as it goes: pressing **Find faces** again on the same photos is instant, and after
+  **Stop** (or closing FileHunter) it carries on where it left off. Edited photos are looked at again.
+- The people list shows the first 300 people (everyone is still sorted), so it opens quickly.
+
 ## 1.3.0 — 2026-10-25
 
 - New **Sort by faces…**: finds the faces in your photos, groups them into people, and makes a folder

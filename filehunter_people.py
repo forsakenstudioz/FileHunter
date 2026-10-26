@@ -13,6 +13,9 @@ import filehunter_faces as faces
 from filehunter_core import APP_NAME, human_size
 
 
+MAX_ROWS = 300   # people rows drawn at once (drawing thousands of faces would freeze the window)
+
+
 class PeopleWindow(tk.Toplevel):
     def __init__(self, app, photos: list[core.FileItem], source_note: str):
         super().__init__(app)
@@ -25,6 +28,9 @@ class PeopleWindow(tk.Toplevel):
         self.errors: dict[str, str] = {}
         self.scan: faces.FaceScan | None = None
         self.job: threading.Thread | None = None
+        self.grouping: threading.Thread | None = None
+        self.group_stop = threading.Event()
+        self.group_progress = (0, 1, "")
         self.job_msg = ""
         self.job_progress = (0, 0)
         self.thumbs: dict[int, tk.PhotoImage] = {}
@@ -157,7 +163,7 @@ class PeopleWindow(tk.Toplevel):
                         command=self._mode_changed).pack(side="left", padx=(10, 16))
         self.remember = tk.BooleanVar(value=True)
         ttk.Checkbutton(r3, text="Remember names and order next time", variable=self.remember).pack(side="left")
-        ttk.Button(r3, text="Forget remembered people", command=self._forget).pack(side="left", padx=(8, 0))
+        ttk.Button(r3, text="Forget people & saved results", command=self._forget).pack(side="left", padx=(8, 0))
         self.btn_go = ttk.Button(r3, text="Sort photos", style="Accent.TButton", command=self._go)
         self.btn_go.pack(side="right")
         self.summary = ttk.Label(c, text="", style="Muted.TLabel", wraplength=int(940 * s), justify="left")
@@ -216,7 +222,7 @@ class PeopleWindow(tk.Toplevel):
             return
         self.people = []
         self._refresh()
-        self.scan = faces.FaceScan([it.path for it in self.photos])
+        self.scan = faces.FaceScan([it.path for it in self.photos], workers=faces.default_workers())
         self.scan.start()
         self._update_buttons()
 
@@ -228,6 +234,8 @@ class PeopleWindow(tk.Toplevel):
     def _stop(self):
         if self.scan and not self.scan.done:
             self.scan.stop()
+        if self.grouping is not None:
+            self.group_stop.set()
 
     def _tick(self):
         if not self.winfo_exists():
@@ -238,13 +246,35 @@ class PeopleWindow(tk.Toplevel):
             self.bar["value"] = sc.done_count * 1000 // n
             if not sc.done:
                 el = time.time() - sc.started
-                left = el / max(1, sc.done_count) * (n - sc.done_count) if sc.done_count else 0
-                state = "Paused" if sc.paused else "Looking for faces"
-                self.msg.configure(text=f"{state}… {sc.done_count:,} of {n:,} photos · {len(sc.faces):,} faces"
-                                        f" · about {int(left // 60)}m {int(left % 60):02d}s left   "
-                                        f"{os.path.basename(sc.current)}", style="Muted.TLabel")
+                fresh = sc.done_count - sc.from_cache
+                todo = n - sc.done_count
+                if fresh >= 3:
+                    left = el * todo / fresh
+                    eta = f" · about {int(left // 3600)}h {int(left % 3600 // 60):02d}m left" if left >= 3600 \
+                        else f" · about {int(left // 60)}m {int(left % 60):02d}s left"
+                else:
+                    eta = ""
+                saved = f" ({sc.from_cache:,} already done before)" if sc.from_cache else ""
+                if sc.paused:
+                    state = "Paused"
+                elif sc.done_count == 0 or sc.stage != "Looking for faces":
+                    state = sc.stage.rstrip("…")
+                else:
+                    state = f"Looking for faces on {sc.workers} core{'s' if sc.workers > 1 else ''}"
+                self.msg.configure(text=f"{state}… {sc.done_count:,} of {n:,} photos{saved} · "
+                                        f"{len(sc.faces):,} faces{eta}   {os.path.basename(sc.current)}",
+                                   style="Muted.TLabel")
             else:
                 self._scan_done()
+        if self.grouping is not None:
+            d, t, text = self.group_progress
+            self.bar["value"] = d * 1000 // max(1, t)
+            if self.grouping.is_alive():
+                self.msg.configure(text=f"{text}… {d:,} of {t:,} faces. This takes a moment for big "
+                                        "collections; the window stays usable.", style="Muted.TLabel")
+            else:
+                self.grouping = None
+                self._grouping_done()
         if self.job is not None:
             d, t = self.job_progress
             if t:
@@ -270,12 +300,42 @@ class PeopleWindow(tk.Toplevel):
             self._update_buttons()
             return
         self.no_face, self.errors = sc.no_face, sc.errors
-        self.people = faces.group_faces(sc.faces, faces.load_known())
-        self.done_paths = [p for p in sc.paths[:sc.done_count]]
+        self.done_paths = list(sc.done_paths)
+        self._last_scan = sc
+        self.group_stop.clear()
+        self.group_progress = (0, max(1, len(sc.faces)), "Grouping faces into people")
+        found = sc.faces
+        known = faces.load_known()
+
+        def work():
+            try:
+                self._grouped = faces.group_faces(
+                    found, known, stop=self.group_stop,
+                    progress=lambda d, t, text: setattr(self, "group_progress", (d, t, text)))
+                self._group_err = ""
+            except Exception as e:  # noqa: BLE001
+                self._grouped, self._group_err = [], str(e)
+        self.grouping = threading.Thread(target=work, daemon=True)
+        self.grouping.start()
+        self._update_buttons()
+
+    def _grouping_done(self):
+        sc = self._last_scan
+        if self._group_err:
+            self.msg.configure(text=f"Grouping the faces failed: {self._group_err}", style="Err.TLabel")
+            self.app._log(f"faces: grouping failed: {self._group_err}")
+            self._update_buttons()
+            return
+        if self.group_stop.is_set():
+            self.msg.configure(text="Stopped.", style="Muted.TLabel")
+            self._update_buttons()
+            return
+        self.people = self._grouped
         n_people = sum(1 for p in self.people if len(p.photos) >= 2)
         singles = len(self.people) - n_people
         known = sum(1 for p in self.people if p.known)
-        txt = (f"Done in {int(sc.finished - sc.started)}s: {len(sc.faces):,} faces in "
+        took = int(time.time() - sc.started)
+        txt = (f"Done in {took // 60}m {took % 60:02d}s: {len(sc.faces):,} faces in "
                f"{sc.done_count - len(sc.no_face) - len(sc.errors):,} photos, {n_people:,} people seen in "
                f"2 or more photos")
         if singles:
@@ -287,8 +347,10 @@ class PeopleWindow(tk.Toplevel):
             txt += f" {len(sc.errors):,} couldn't be read (see Log)."
             for pth, e in sc.errors.items():
                 self.app._log(f"  faces: couldn't read {pth} ({e})")
+        if sc.from_cache:
+            txt += f" ({sc.from_cache:,} photos were already analysed before, so they were instant.)"
         if sc.stop_ev.is_set():
-            txt = "Stopped. " + txt
+            txt = ("Stopped. Press Find faces again later to carry on where it stopped. " + txt)
         self.msg.configure(text=txt, style="Ok.TLabel")
         self.app._log(txt)
         self._refresh()
@@ -301,12 +363,18 @@ class PeopleWindow(tk.Toplevel):
         m = self._min_photos()
         return [p for p in self.people if len(p.photos) >= m]
 
-    def _thumb(self, person: faces.Person) -> tk.PhotoImage:
-        f = max((f for f in person.faces if not f.excluded), key=lambda f: f.quality, default=person.faces[0])
-        img = tk.PhotoImage(master=self, data=base64.b64encode(f.thumb).decode("ascii"))
+    def _image(self, thumb: bytes, master=None) -> tk.PhotoImage:
+        data = faces.thumb_png(thumb)
+        if not data:
+            return tk.PhotoImage(master=master or self, width=faces.THUMB, height=faces.THUMB)
+        img = tk.PhotoImage(master=master or self, data=base64.b64encode(data).decode("ascii"))
         if self.s >= 1.75:
             img = img.zoom(2)
         return img
+
+    def _thumb(self, person: faces.Person) -> tk.PhotoImage:
+        f = max((f for f in person.faces if not f.excluded), key=lambda f: f.quality, default=person.faces[0])
+        return self._image(f.thumb)
 
     def _refresh(self, keep_sel=None):
         sel = keep_sel if keep_sel is not None else [self.people[int(i)] for i in self.tv.selection()
@@ -314,13 +382,20 @@ class PeopleWindow(tk.Toplevel):
         self.tv.delete(*self.tv.get_children())
         self.thumbs = {}
         rank = 0
+        drawn = 0
+        more = 0
+        keep = {id(x) for x in sel}
         for n, p in enumerate(self.people):
-            if len(p.photos) < self._min_photos():
-                continue
             photos = p.photos
-            alone = sum(1 for ph in photos if self._faces_in(ph) == 1)
+            if len(photos) < self._min_photos():
+                continue
             if p.include:
                 rank += 1
+            if drawn >= MAX_ROWS and id(p) not in keep:
+                more += 1
+                continue
+            drawn += 1
+            alone = sum(1 for ph in photos if self._faces_in(ph) == 1)
             img = self.thumbs[n] = self._thumb(p)
             status = "not sorted" if not p.include else ("recognised from last time" if p.known else "")
             self.tv.insert("", "end", iid=str(n), image=img,
@@ -333,7 +408,9 @@ class PeopleWindow(tk.Toplevel):
             self.tv.selection_set(ids)
             self.tv.see(ids[0])
         hidden = sum(1 for p in self.people if len(p.photos) < 2)
-        self.cb_single.configure(text=f"Show people seen in only one photo ({hidden:,})")
+        self.cb_single.configure(text=f"Show people seen in only one photo ({hidden:,})"
+                                 + (f"     ·  {more:,} more people with fewer photos are not listed "
+                                    "(they are still sorted)" if more else ""))
         self._refresh_summary()
         self._update_buttons()
 
@@ -437,9 +514,7 @@ class PeopleWindow(tk.Toplevel):
         for k, f in enumerate(shown):
             cell = ttk.Frame(inner, padding=4)
             cell.grid(row=k // cols, column=k % cols)
-            im = tk.PhotoImage(master=win, data=base64.b64encode(f.thumb).decode("ascii"))
-            if self.s >= 1.4:
-                im = im.zoom(2) if self.s >= 1.75 else im
+            im = self._image(f.thumb, master=win)
             imgs.append(im)
             lbl = ttk.Label(cell, image=im)
             lbl.pack()
@@ -486,7 +561,8 @@ class PeopleWindow(tk.Toplevel):
             for f in folders:
                 per[f] = per.get(f, 0) + 1
         copies = sum(len(v) for v in plan.values())
-        parts = [f"{k}: {v:,}" for k, v in per.items()]
+        rank = {name: i for i, name in enumerate(faces.folder_names(self.people))}
+        parts = [f"{k}: {v:,}" for k, v in sorted(per.items(), key=lambda kv: rank.get(kv[0], 10 ** 9))]
         txt = " · ".join(parts[:12]) + (" · …" if len(parts) > 12 else "")
         left_out = len(getattr(self, "done_paths", [])) - len(plan)
         txt += f"\n{len(plan):,} photos into {len(per):,} folders"
@@ -511,8 +587,11 @@ class PeopleWindow(tk.Toplevel):
             self.dest.set(os.path.abspath(d))
 
     def _forget(self):
-        if messagebox.askyesno(APP_NAME, "Forget every remembered person (names and face data)?", parent=self):
+        if messagebox.askyesno(APP_NAME, "Forget every remembered person (names and face data), and the "
+                                         "saved face-search results?\n\nThe next Find faces will look "
+                                         "at every photo again.", parent=self):
             faces.forget_known()
+            faces.clear_cache()
             for p in self.people:
                 p.known = False
             self._refresh()
@@ -565,11 +644,11 @@ class PeopleWindow(tk.Toplevel):
         def st(w, on):
             w.state(["!disabled"] if on else ["disabled"])
         scanning = self.scan is not None and not self.scan.done
-        busy = scanning or self.job is not None
+        busy = scanning or self.job is not None or self.grouping is not None
         st(self.btn_find, not busy and not getattr(self, "setup_needed", "") and bool(self.photos))
         st(self.btn_setup, not busy)
         st(self.btn_pause, scanning)
-        st(self.btn_stop, scanning)
+        st(self.btn_stop, scanning or self.grouping is not None)
         self.btn_pause.configure(text="Resume" if scanning and self.scan.paused else "Pause")
         sel = self.tv.selection() if hasattr(self, "tv") else ()
         for bt in self.side_btns:
@@ -581,6 +660,7 @@ class PeopleWindow(tk.Toplevel):
             if not messagebox.askyesno(APP_NAME, "Stop looking for faces and close?", parent=self):
                 return
             self.scan.stop()
+        self.group_stop.set()
         if not force and self.people and self.remember.get() and \
                 any(not p.name.startswith("Person ") for p in self.people):
             try:

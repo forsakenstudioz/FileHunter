@@ -21,7 +21,7 @@ from datetime import datetime
 from pathlib import Path
 
 APP_NAME = "FileHunter"
-VERSION = "1.3.0"
+VERSION = "1.3.1"
 
 IS_WIN = os.name == "nt"
 IS_MAC = sys.platform == "darwin"

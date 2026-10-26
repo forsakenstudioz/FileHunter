@@ -41,6 +41,8 @@ want, and copy or move it all into one place.
   **Same person: merge** joins two groups of one person. Photos with nobody from the list can go to an
   *Others* folder.
 - It remembers the names and order, so next time your people are recognised straight away.
+- It uses several processor cores and saves its results as it goes: the first search of a big collection
+  takes a while, but pressing **Find faces** again (or after **Stop**) is instant for photos already done.
 - Private: it all runs on your computer using OpenCV's free face models (a one-time 39 MB download).
   Your photos are never uploaded. The remembered face data is in `people.json` in the settings folder,
   and **Forget remembered people** deletes it.
